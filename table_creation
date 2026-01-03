@@ -1,0 +1,254 @@
+sql/schema.sql
+
+------------------------------------------------------------
+-- 1) CREATE TABLES
+------------------------------------------------------------
+
+-- Baseline plaintext
+CREATE TABLE users_plain (
+  user_id     NUMBER PRIMARY KEY,
+  full_name   VARCHAR2(100),
+  email       VARCHAR2(200),
+  created_at  DATE,
+  salary      NUMBER,
+  dept        VARCHAR2(50)
+);
+
+-- Encrypted-at-rest version (same columns)
+CREATE TABLE users_enc (
+  user_id     NUMBER PRIMARY KEY,
+  full_name   VARCHAR2(100),
+  email       VARCHAR2(200) ENCRYPT USING 'AES256',
+  created_at  DATE,
+  salary      NUMBER,
+  dept        VARCHAR2(50)
+);
+
+-- Transactions used for join tests
+CREATE TABLE transactions_t (
+  txn_id    NUMBER PRIMARY KEY,
+  user_id   NUMBER,
+  amount    NUMBER,
+  txn_date  DATE,
+  remarks   VARCHAR2(200)
+);
+
+-- Indexes (same idea for fairness)
+CREATE INDEX idx_plain_createdat ON users_plain(created_at);
+CREATE INDEX idx_enc_createdat   ON users_enc(created_at);
+CREATE INDEX idx_txn_user        ON transactions_t(user_id);
+CREATE INDEX idx_txn_date        ON transactions_t(txn_date);
+
+------------------------------------------------------------
+-- 2) RESULTS TABLE
+------------------------------------------------------------
+CREATE TABLE perf_results (
+  dataset_size   NUMBER,
+  enc_mode       VARCHAR2(20),     -- BASELINE or ENC
+  test_name      VARCHAR2(100),
+  run_no         NUMBER,
+  elapsed_ms     NUMBER,
+  rows_affected  NUMBER,
+  recorded_at    DATE DEFAULT SYSDATE,
+  notes          VARCHAR2(200)
+);
+
+CREATE INDEX idx_perf_results
+ON perf_results (test_name, dataset_size, enc_mode);
+
+------------------------------------------------------------
+-- 3) TIMING PROCEDURE (auto-saves each run)
+------------------------------------------------------------
+CREATE OR REPLACE PROCEDURE run_timed_test_save(
+  p_dataset_size IN NUMBER,
+  p_enc_mode     IN VARCHAR2,
+  p_test_name    IN VARCHAR2,
+  p_sql          IN CLOB,
+  p_runs         IN NUMBER DEFAULT 5,
+  p_notes        IN VARCHAR2 DEFAULT NULL
+)
+IS
+  l_start      NUMBER;
+  l_end        NUMBER;
+  l_cur        INTEGER;
+  l_rows       NUMBER;
+  l_elapsed_ms NUMBER;
+BEGIN
+  FOR i IN 1..p_runs LOOP
+    l_rows := NULL;
+
+    l_start := DBMS_UTILITY.GET_TIME;
+
+    l_cur := DBMS_SQL.OPEN_CURSOR;
+    DBMS_SQL.PARSE(l_cur, p_sql, DBMS_SQL.NATIVE);
+    l_rows := DBMS_SQL.EXECUTE(l_cur);
+    DBMS_SQL.CLOSE_CURSOR(l_cur);
+
+    l_end := DBMS_UTILITY.GET_TIME;
+    l_elapsed_ms := (l_end - l_start) * 10; -- centiseconds -> ms
+
+    INSERT INTO perf_results
+      (dataset_size, enc_mode, test_name, run_no, elapsed_ms, rows_affected, notes)
+    VALUES
+      (p_dataset_size, UPPER(p_enc_mode), UPPER(p_test_name), i,
+       l_elapsed_ms, l_rows, p_notes);
+
+    COMMIT;
+  END LOOP;
+
+EXCEPTION
+  WHEN OTHERS THEN
+    IF DBMS_SQL.IS_OPEN(l_cur) THEN
+      DBMS_SQL.CLOSE_CURSOR(l_cur);
+    END IF;
+    RAISE;
+END;
+/
+SHOW ERRORS;
+
+------------------------------------------------------------
+-- 4) STORAGE SNAPSHOT (auto-saves MB sizes as "elapsed_ms")
+------------------------------------------------------------
+CREATE OR REPLACE PROCEDURE save_storage_snapshot(
+  p_dataset_size IN NUMBER,
+  p_enc_mode     IN VARCHAR2,
+  p_notes        IN VARCHAR2 DEFAULT NULL
+)
+IS
+  l_users_mb NUMBER;
+  l_txn_mb   NUMBER;
+  l_seg_user VARCHAR2(30);
+BEGIN
+  l_seg_user := CASE UPPER(p_enc_mode)
+                  WHEN 'BASELINE' THEN 'USERS_PLAIN'
+                  ELSE 'USERS_ENC'
+                END;
+
+  SELECT ROUND(NVL(SUM(bytes),0)/1024/1024, 2)
+    INTO l_users_mb
+    FROM user_segments
+   WHERE segment_name = l_seg_user;
+
+  SELECT ROUND(NVL(SUM(bytes),0)/1024/1024, 2)
+    INTO l_txn_mb
+    FROM user_segments
+   WHERE segment_name = 'TRANSACTIONS_T';
+
+  INSERT INTO perf_results(dataset_size, enc_mode, test_name, run_no, elapsed_ms, notes)
+  VALUES (p_dataset_size, UPPER(p_enc_mode), 'STORAGE_USERS_MB', 1, l_users_mb, p_notes);
+
+  INSERT INTO perf_results(dataset_size, enc_mode, test_name, run_no, elapsed_ms, notes)
+  VALUES (p_dataset_size, UPPER(p_enc_mode), 'STORAGE_TRANSACTIONS_MB', 1, l_txn_mb, p_notes);
+
+  COMMIT;
+END;
+/
+SHOW ERRORS;
+
+------------------------------------------------------------
+-- 5) DATA LOADER (loads both plaintext and encrypted tables)
+------------------------------------------------------------
+CREATE OR REPLACE PROCEDURE load_dataset(
+  p_n_users IN NUMBER,
+  p_n_txns  IN NUMBER
+)
+IS
+BEGIN
+  EXECUTE IMMEDIATE 'TRUNCATE TABLE transactions_t';
+  EXECUTE IMMEDIATE 'TRUNCATE TABLE users_plain';
+  EXECUTE IMMEDIATE 'TRUNCATE TABLE users_enc';
+
+  INSERT /*+ APPEND */ INTO users_plain (user_id, full_name, email, created_at, salary, dept)
+  SELECT
+    LEVEL,
+    'User ' || LEVEL,
+    'user' || LEVEL || '@mail.com',
+    DATE '2024-01-01' + MOD(LEVEL, 365),
+    3000 + MOD(LEVEL, 7000),
+    CASE MOD(LEVEL, 5)
+      WHEN 0 THEN 'IT'
+      WHEN 1 THEN 'HR'
+      WHEN 2 THEN 'FIN'
+      WHEN 3 THEN 'OPS'
+      ELSE 'MKT'
+    END
+  FROM dual
+  CONNECT BY LEVEL <= p_n_users;
+
+  INSERT /*+ APPEND */ INTO users_enc (user_id, full_name, email, created_at, salary, dept)
+  SELECT user_id, full_name, email, created_at, salary, dept
+  FROM users_plain;
+
+  INSERT /*+ APPEND */ INTO transactions_t (txn_id, user_id, amount, txn_date, remarks)
+  SELECT
+    LEVEL,
+    MOD(LEVEL, p_n_users) + 1,
+    ROUND(DBMS_RANDOM.VALUE(10, 500), 2),
+    DATE '2024-01-01' + MOD(LEVEL, 365),
+    'Remark ' || LEVEL
+  FROM dual
+  CONNECT BY LEVEL <= p_n_txns;
+
+  COMMIT;
+END;
+/
+SHOW ERRORS;
+
+CREATE OR REPLACE PROCEDURE load_dataset(
+  p_n_users IN NUMBER,
+  p_n_txns  IN NUMBER
+)
+IS
+BEGIN
+  -- ensure parallel DML is off inside the procedure too
+  EXECUTE IMMEDIATE 'ALTER SESSION DISABLE PARALLEL DML';
+
+  EXECUTE IMMEDIATE 'TRUNCATE TABLE transactions_t';
+  EXECUTE IMMEDIATE 'TRUNCATE TABLE users_plain';
+  EXECUTE IMMEDIATE 'TRUNCATE TABLE users_enc';
+
+  INSERT INTO users_plain (user_id, full_name, email, created_at, salary, dept)
+  SELECT
+    LEVEL,
+    'User ' || LEVEL,
+    'user' || LEVEL || '@mail.com',
+    DATE '2024-01-01' + MOD(LEVEL, 365),
+    3000 + MOD(LEVEL, 7000),
+    CASE MOD(LEVEL, 5)
+      WHEN 0 THEN 'IT'
+      WHEN 1 THEN 'HR'
+      WHEN 2 THEN 'FIN'
+      WHEN 3 THEN 'OPS'
+      ELSE 'MKT'
+    END
+  FROM dual
+  CONNECT BY LEVEL <= p_n_users;
+
+  COMMIT;
+
+  INSERT INTO users_enc (user_id, full_name, email, created_at, salary, dept)
+  SELECT user_id, full_name, email, created_at, salary, dept
+  FROM users_plain;
+
+  COMMIT;
+
+  INSERT INTO transactions_t (txn_id, user_id, amount, txn_date, remarks)
+  SELECT
+    LEVEL,
+    MOD(LEVEL, p_n_users) + 1,
+    ROUND(DBMS_RANDOM.VALUE(10, 500), 2),
+    DATE '2024-01-01' + MOD(LEVEL, 365),
+    'Remark ' || LEVEL
+  FROM dual
+  CONNECT BY LEVEL <= p_n_txns;
+
+  COMMIT;
+END;
+/
+SHOW ERRORS;
+
+
+
+
+
+
